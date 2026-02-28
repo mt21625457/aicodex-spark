@@ -155,6 +155,18 @@ impl Server {
             }
         };
 
+        if let Some(gitea_cfg) = &config.gitea_prreview {
+            crate::gitea_prreview::spawn_cleanup_task(gitea_cfg.clone());
+            tracing::info!(
+                repo_data_dir = %gitea_cfg.repo_data_dir.display(),
+                "Gitea PR review integration enabled"
+            );
+        } else {
+            tracing::info!(
+                "Gitea PR review integration not configured. Set GITEA_PRREVIEW_* envs (or GITEA_PRREVIEW_CONFIG_FILE) to enable."
+            );
+        }
+
         if billing.is_configured() {
             tracing::info!("Billing provider configured");
         } else {

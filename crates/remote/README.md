@@ -25,6 +25,55 @@ LOOPS_EMAIL_API_KEY=
 
 Generate `VIBEKANBAN_REMOTE_JWT_SECRET` once using `openssl rand -base64 48` and copy the value into `.env.remote`.
 
+## Gitea PR Review webhook configuration (optional)
+
+To enable `POST /v1/gitea/prreview`, configure either environment variables directly, or set a YAML config file and override selectively via env vars.
+
+Environment variables (minimum required):
+
+```env
+GITEA_PRREVIEW_REPO_DATA_DIR=/data/aicodex/gitea-prreview
+GITEA_PRREVIEW_WEBHOOK_SECRET=your_webhook_secret
+GITEA_PRREVIEW_TOKEN=your_gitea_api_token
+```
+
+Optional capacity/retention controls:
+
+```env
+GITEA_PRREVIEW_RETENTION_HOURS=24
+GITEA_PRREVIEW_DELIVERY_RETENTION_HOURS=72
+GITEA_PRREVIEW_MAX_TOTAL_GB=20
+GITEA_PRREVIEW_MIN_FREE_GB=5
+GITEA_PRREVIEW_MAX_REPO_SIZE_MB=2048
+GITEA_PRREVIEW_CLEANUP_INTERVAL_SECONDS=300
+GITEA_PRREVIEW_KEEP_FAILED_HOURS=12
+GITEA_PRREVIEW_FEEDBACK_MAX_ATTEMPTS=3
+```
+
+Optional startup config file:
+
+```env
+GITEA_PRREVIEW_CONFIG_FILE=/etc/aicodex/gitea-prreview.yaml
+```
+
+Example `/etc/aicodex/gitea-prreview.yaml`:
+
+```yaml
+gitea_prreview:
+  repo_data_dir: /data/aicodex/gitea-prreview
+  webhook_secret: your_webhook_secret
+  token: your_gitea_api_token
+  retention_hours: 24
+  delivery_retention_hours: 72
+  max_total_gb: 20
+  min_free_gb: 5
+  max_repo_size_mb: 2048
+  cleanup_interval_seconds: 300
+  keep_failed_hours: 12
+```
+
+Config precedence is: `environment variables > config file > defaults`.
+
 ## Run the stack locally
 
 ```bash

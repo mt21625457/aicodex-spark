@@ -41,6 +41,15 @@ impl Review {
     pub fn is_webhook_review(&self) -> bool {
         self.github_installation_id.is_some()
     }
+
+    /// Gitea webhook reviews use `github_installation_id = 0` as provider marker.
+    pub fn is_gitea_webhook_review(&self) -> bool {
+        self.github_installation_id == Some(0)
+    }
+
+    pub fn is_github_webhook_review(&self) -> bool {
+        self.github_installation_id.is_some_and(|id| id > 0)
+    }
 }
 
 /// Parameters for creating a new review (CLI-triggered)

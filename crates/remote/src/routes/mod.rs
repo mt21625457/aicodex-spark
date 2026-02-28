@@ -29,9 +29,10 @@ mod billing {
         Router::new()
     }
 }
+pub mod attachments;
 pub(crate) mod electric_proxy;
 pub(crate) mod error;
-pub mod attachments;
+mod gitea_prreview;
 mod github_app;
 mod identity;
 pub mod issue_assignees;
@@ -106,6 +107,7 @@ pub fn router(state: AppState) -> Router {
         .merge(organization_members::public_router())
         .merge(tokens::public_router())
         .merge(review::public_router())
+        .merge(gitea_prreview::public_router())
         .merge(github_app::public_router())
         .merge(billing::public_router());
 

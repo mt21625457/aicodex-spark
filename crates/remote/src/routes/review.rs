@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::{net::IpAddr, time::Duration as StdDuration};
 
 use axum::{
     Json, Router,
@@ -9,12 +9,18 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Duration, Utc};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+use url::Url;
 use uuid::Uuid;
 
 use crate::{
     AppState,
-    db::reviews::{CreateReviewParams, ReviewRepository},
+    config::GiteaPrReviewConfig,
+    db::{
+        gitea_prreview::GiteaPrReviewRepository,
+        reviews::{CreateReviewParams, Review, ReviewRepository},
+    },
     r2::R2Error,
 };
 
@@ -81,9 +87,10 @@ pub enum ReviewError {
 impl IntoResponse for ReviewError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            ReviewError::Disabled => {
-                (StatusCode::SERVICE_UNAVAILABLE, "Review feature is disabled")
-            }
+            ReviewError::Disabled => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Review feature is disabled",
+            ),
             ReviewError::NotConfigured => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Review upload service not available",
@@ -391,6 +398,212 @@ pub async fn get_review_diff(
     proxy_to_worker(&state, &format!("/review/{}/diff", review_id)).await
 }
 
+async fn post_gitea_pr_comment(
+    state: &AppState,
+    review: &Review,
+    body: &str,
+) -> Result<(), String> {
+    let gitea_cfg = state
+        .config
+        .gitea_prreview
+        .as_ref()
+        .ok_or_else(|| "gitea config is not enabled".to_string())?;
+    let owner = review
+        .pr_owner
+        .as_deref()
+        .ok_or_else(|| "missing review.pr_owner".to_string())?;
+    let repo = review
+        .pr_repo
+        .as_deref()
+        .ok_or_else(|| "missing review.pr_repo".to_string())?;
+    let pr_number = review
+        .pr_number
+        .ok_or_else(|| "missing review.pr_number".to_string())?;
+
+    let pr_url = Url::parse(&review.gh_pr_url).map_err(|e| format!("invalid PR URL: {e}"))?;
+    let host = pr_url
+        .host_str()
+        .ok_or_else(|| "PR URL missing host".to_string())?;
+    let mut base = format!("{}://{}", pr_url.scheme(), host);
+    if let Some(port) = pr_url.port() {
+        base = format!("{base}:{port}");
+    }
+
+    let api_url = format!(
+        "{}/api/v1/repos/{}/{}/issues/{}/comments",
+        base.trim_end_matches('/'),
+        owner,
+        repo,
+        pr_number
+    );
+
+    let response = state
+        .http_client
+        .post(&api_url)
+        .header(
+            "Authorization",
+            format!("token {}", gitea_cfg.token.expose_secret()),
+        )
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await
+        .map_err(|e| format!("failed to call gitea comment API: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("gitea comment API returned {status}: {text}"));
+    }
+
+    Ok(())
+}
+
+fn gitea_feedback_max_attempts() -> usize {
+    std::env::var("GITEA_PRREVIEW_FEEDBACK_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(3)
+}
+
+async fn run_feedback_retry_loop<F, Fut>(max_attempts: usize, mut action: F) -> Result<(), String>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut last_error = None;
+
+    for attempt in 1..=max_attempts {
+        match action(attempt).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < max_attempts {
+                    tokio::time::sleep(StdDuration::from_millis(500 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+
+    let error_detail = last_error.unwrap_or_else(|| "unknown_error".to_string());
+    Err(format!(
+        "feedback publish failed after {max_attempts} attempts: {error_detail}"
+    ))
+}
+
+fn build_gitea_success_comment(review_url: &str) -> String {
+    format!(
+        "## Review Complete\n\n\
+        Your review story is ready!\n\n\
+        **[View Story]({})**\n\n\
+        Comment **!reviewfast** on this PR to re-generate the story.",
+        review_url
+    )
+}
+
+fn build_gitea_failure_comment(review_id: Uuid) -> String {
+    format!(
+        "## Vibe Kanban Review Failed\n\n\
+        Unfortunately, the code review could not be completed.\n\n\
+        Review ID: `{}`",
+        review_id
+    )
+}
+
+async fn publish_gitea_feedback_with_retry(
+    state: &AppState,
+    review_id: Uuid,
+    review: &Review,
+    terminal_state: &'static str,
+    comment: &str,
+) -> Result<(), String> {
+    let feedback_repo = GiteaPrReviewRepository::new(state.pool());
+    let max_attempts = gitea_feedback_max_attempts();
+
+    run_feedback_retry_loop(max_attempts, |attempt| {
+        let feedback_repo = &feedback_repo;
+        async move {
+            let attempt_state = feedback_repo
+                .begin_feedback_attempt(review_id, terminal_state)
+                .await
+                .map_err(|e| format!("failed to record feedback attempt: {e}"))?;
+
+            if attempt_state.already_posted {
+                return Ok(());
+            }
+
+            match post_gitea_pr_comment(state, review, comment).await {
+                Ok(()) => {
+                    feedback_repo
+                        .mark_feedback_posted(review_id, terminal_state)
+                        .await
+                        .map_err(|e| format!("failed to mark feedback posted: {e}"))?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = feedback_repo
+                        .mark_feedback_error(review_id, terminal_state, &err)
+                        .await;
+                    Err(format!("attempt {attempt} failed: {err}"))
+                }
+            }
+        }
+    })
+    .await
+}
+
+fn mark_gitea_job_terminal_state(
+    config: &GiteaPrReviewConfig,
+    review_id: Uuid,
+    status: &'static str,
+) -> Result<(), String> {
+    let jobs_root = config.repo_data_dir.join("jobs");
+    if !jobs_root.exists() {
+        return Ok(());
+    }
+
+    let target_review_id = review_id.to_string();
+    for entry in std::fs::read_dir(&jobs_root).map_err(|e| format!("read jobs dir failed: {e}"))? {
+        let entry = entry.map_err(|e| format!("read jobs entry failed: {e}"))?;
+        let job_path = entry.path();
+        if !job_path.is_dir() {
+            continue;
+        }
+
+        let state_path = job_path.join("state.json");
+        if !state_path.exists() {
+            continue;
+        }
+
+        let raw = std::fs::read(&state_path)
+            .map_err(|e| format!("read {} failed: {e}", state_path.display()))?;
+        let mut state: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|e| format!("parse {} failed: {e}", state_path.display()))?;
+
+        if state["review_id"].as_str() != Some(target_review_id.as_str()) {
+            continue;
+        }
+
+        state["status"] = serde_json::json!(status);
+        state["updated_at"] = serde_json::json!(Utc::now().to_rfc3339());
+        if status == "failed" {
+            state["cleanup_after"] = serde_json::json!(
+                (Utc::now() + Duration::hours(config.keep_failed_hours as i64)).to_rfc3339()
+            );
+        }
+
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&state)
+                .map_err(|e| format!("serialize {} failed: {e}", state_path.display()))?,
+        )
+        .map_err(|e| format!("write {} failed: {e}", state_path.display()))?;
+        return Ok(());
+    }
+
+    Ok(())
+}
+
 /// POST /review/:id/success - Called by worker when review completes successfully
 /// Sends success notification email to the user, or posts PR comment for webhook reviews
 pub async fn review_success(
@@ -411,30 +624,49 @@ pub async fn review_success(
 
     // Check if this is a webhook-triggered review
     if review.is_webhook_review() {
-        // Post PR comment instead of sending email
-        if let Some(github_app) = state.github_app() {
-            let comment = format!(
-                "## Review Complete\n\n\
-                Your review story is ready!\n\n\
-                **[View Story]({})**\n\n\
-                Comment **!reviewfast** on this PR to re-generate the story.",
-                review_url
-            );
-
-            let installation_id = review.github_installation_id.unwrap_or(0);
-            let pr_owner = review.pr_owner.as_deref().unwrap_or("");
-            let pr_repo = review.pr_repo.as_deref().unwrap_or("");
-            let pr_number = review.pr_number.unwrap_or(0) as u64;
-
-            if let Err(e) = github_app
-                .post_pr_comment(installation_id, pr_owner, pr_repo, pr_number, &comment)
-                .await
+        if review.is_gitea_webhook_review() {
+            let comment = build_gitea_success_comment(&review_url);
+            if let Err(e) =
+                publish_gitea_feedback_with_retry(&state, review_id, &review, "completed", &comment)
+                    .await
             {
                 tracing::error!(
                     ?e,
                     review_id = %review_id,
-                    "Failed to post success comment to PR"
+                    "Failed to post success comment to Gitea PR"
                 );
+            }
+            if let Some(gitea_cfg) = state.config.gitea_prreview.as_ref()
+                && let Err(e) = mark_gitea_job_terminal_state(gitea_cfg, review_id, "completed")
+            {
+                tracing::warn!(?e, review_id = %review_id, "Failed to mark gitea job completed");
+            }
+        } else if review.is_github_webhook_review() {
+            // Post PR comment instead of sending email
+            if let Some(github_app) = state.github_app() {
+                let comment = format!(
+                    "## Review Complete\n\n\
+                    Your review story is ready!\n\n\
+                    **[View Story]({})**\n\n\
+                    Comment **!reviewfast** on this PR to re-generate the story.",
+                    review_url
+                );
+
+                let installation_id = review.github_installation_id.unwrap_or(0);
+                let pr_owner = review.pr_owner.as_deref().unwrap_or("");
+                let pr_repo = review.pr_repo.as_deref().unwrap_or("");
+                let pr_number = review.pr_number.unwrap_or(0) as u64;
+
+                if let Err(e) = github_app
+                    .post_pr_comment(installation_id, pr_owner, pr_repo, pr_number, &comment)
+                    .await
+                {
+                    tracing::error!(
+                        ?e,
+                        review_id = %review_id,
+                        "Failed to post success comment to PR"
+                    );
+                }
             }
         }
     } else if let Some(email) = &review.email {
@@ -465,29 +697,48 @@ pub async fn review_failed(
 
     // Check if this is a webhook-triggered review
     if review.is_webhook_review() {
-        // Post PR comment instead of sending email
-        if let Some(github_app) = state.github_app() {
-            let comment = format!(
-                "## Vibe Kanban Review Failed\n\n\
-                Unfortunately, the code review could not be completed.\n\n\
-                Review ID: `{}`",
-                review_id
-            );
-
-            let installation_id = review.github_installation_id.unwrap_or(0);
-            let pr_owner = review.pr_owner.as_deref().unwrap_or("");
-            let pr_repo = review.pr_repo.as_deref().unwrap_or("");
-            let pr_number = review.pr_number.unwrap_or(0) as u64;
-
-            if let Err(e) = github_app
-                .post_pr_comment(installation_id, pr_owner, pr_repo, pr_number, &comment)
-                .await
+        if review.is_gitea_webhook_review() {
+            let comment = build_gitea_failure_comment(review_id);
+            if let Err(e) =
+                publish_gitea_feedback_with_retry(&state, review_id, &review, "failed", &comment)
+                    .await
             {
                 tracing::error!(
                     ?e,
                     review_id = %review_id,
-                    "Failed to post failure comment to PR"
+                    "Failed to post failure comment to Gitea PR"
                 );
+            }
+            if let Some(gitea_cfg) = state.config.gitea_prreview.as_ref()
+                && let Err(e) = mark_gitea_job_terminal_state(gitea_cfg, review_id, "failed")
+            {
+                tracing::warn!(?e, review_id = %review_id, "Failed to mark gitea job failed");
+            }
+        } else if review.is_github_webhook_review() {
+            // Post PR comment instead of sending email
+            if let Some(github_app) = state.github_app() {
+                let comment = format!(
+                    "## Vibe Kanban Review Failed\n\n\
+                    Unfortunately, the code review could not be completed.\n\n\
+                    Review ID: `{}`",
+                    review_id
+                );
+
+                let installation_id = review.github_installation_id.unwrap_or(0);
+                let pr_owner = review.pr_owner.as_deref().unwrap_or("");
+                let pr_repo = review.pr_repo.as_deref().unwrap_or("");
+                let pr_number = review.pr_number.unwrap_or(0) as u64;
+
+                if let Err(e) = github_app
+                    .post_pr_comment(installation_id, pr_owner, pr_repo, pr_number, &comment)
+                    .await
+                {
+                    tracing::error!(
+                        ?e,
+                        review_id = %review_id,
+                        "Failed to post failure comment to PR"
+                    );
+                }
             }
         }
     } else if let Some(email) = &review.email {
@@ -499,4 +750,75 @@ pub async fn review_failed(
     }
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::{
+        build_gitea_failure_comment, build_gitea_success_comment, run_feedback_retry_loop,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn success_comment_contains_review_link_and_trigger_hint() {
+        let comment = build_gitea_success_comment("https://example.com/review/123");
+        assert!(comment.contains("Review Complete"));
+        assert!(comment.contains("https://example.com/review/123"));
+        assert!(comment.contains("!reviewfast"));
+    }
+
+    #[test]
+    fn failure_comment_contains_traceable_review_id() {
+        let review_id = Uuid::new_v4();
+        let comment = build_gitea_failure_comment(review_id);
+        assert!(comment.contains("Review Failed"));
+        assert!(comment.contains(&review_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn retry_loop_eventually_succeeds() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_ref = Arc::clone(&attempts);
+
+        let result = run_feedback_retry_loop(3, move |_| {
+            let attempts = Arc::clone(&attempts_ref);
+            async move {
+                let current = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if current < 2 {
+                    Err("transient_error".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_loop_exhaustion_returns_error() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_ref = Arc::clone(&attempts);
+
+        let result = run_feedback_retry_loop(3, move |_| {
+            let attempts = Arc::clone(&attempts_ref);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err("still_failing".to_string())
+            }
+        })
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.contains("after 3 attempts"));
+        assert!(error.contains("still_failing"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
 }

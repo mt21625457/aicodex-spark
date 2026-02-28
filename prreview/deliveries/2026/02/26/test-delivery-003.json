@@ -1,0 +1,28 @@
+{
+  "delivery_id": "test-delivery-003",
+  "event_type": "pull_request",
+  "received_at": "2026-02-26T11:53:44.018140+00:00",
+  "payload": {
+    "action": "opened",
+    "repository": {
+      "owner": {
+        "login": "acme"
+      },
+      "name": "demo-repo",
+      "clone_url": "https://gitea.example/acme/demo-repo.git"
+    },
+    "pull_request": {
+      "number": 2,
+      "title": "feat: test2",
+      "body": "demo",
+      "html_url": "https://gitea.example/acme/demo-repo/pulls/2",
+      "url": "https://gitea.example/api/v1/repos/acme/demo-repo/pulls/2",
+      "head": {
+        "sha": "abc124"
+      },
+      "base": {
+        "ref": "main"
+      }
+    }
+  }
+}
